@@ -15,6 +15,7 @@ using Run = Olsson.GET.Common.DataContracts.Runs.Run;
 using System.Globalization;
 using CsvHelper.Configuration;
 using CsvHelper;
+using Microsoft.Extensions.Logging;
 
 namespace Olsson.GET.Engines.ModelInputOutputEngines
 {
@@ -22,6 +23,8 @@ namespace Olsson.GET.Engines.ModelInputOutputEngines
     {
         public const string BudgetGroundwaterFileName = "Budget/Groundwater.bud";
         public const string BaselineBudgetGroundwaterFileName = "Budget/Groundwater.Baseline.bud";
+
+        private static readonly ILogger Logger = Logging.GetLogger<IWFMModelInputOutputEngine>();
 
         private Model Model { get; }
 
@@ -58,56 +61,83 @@ namespace Olsson.GET.Engines.ModelInputOutputEngines
             var userDataObject = JsonConvert.DeserializeObject<UserDataJson>(Encoding.UTF8.GetString(file));
 
 
-            var nodeLocations = modelFileAccessor.GetIWFMNodeLocations();
-
-            var nodePoints = nodeLocations.ToDictionary(x => x.Key, x => new Point(x.Value.Item2, x.Value.Item1));
-            // find the closest node to each of the input locations
-            userDataObject.UserDataPointInputs.ForEach(inputPoint =>
+            // Some scenario JSON formats (e.g. sustainability-project / polygon uploads)
+            // do not contain any point inputs. Treat that as "nothing to do" for this
+            // sub-engine rather than crashing output generation for the whole run.
+            if (userDataObject?.UserDataPointInputs != null && userDataObject.UserDataPointInputs.Count > 0)
             {
-                var inputPointGeometry = new Point(inputPoint.Lng, inputPoint.Lat);
-                var closestNode = nodePoints.Keys.Select(x => new
-                { Node = x, Distance = nodePoints[x].Distance(inputPointGeometry) })
-                    .OrderBy(x => x.Distance)
-                    .First().Node;
+                var nodeLocations = modelFileAccessor.GetIWFMNodeLocations();
 
-                inputPoint.ClosestNode = closestNode;
-            });
-
-            var parsedHeadAllOutputFile = ParseHeadAllOutputFile(modelFileAccessor);
-            var baselineHeadAllOutputFile = ParseHeadAllOutputFile(modelFileAccessor, true);
-
-            // get the NodeWaterLevelLayer.csv file 
-            // this file maps which layer each node will use, instead of it always defaulting to the last layer
-            var nodeToLayerMapping = modelFileAccessor.GetNodeWaterLevelLayerMapping();
-            userDataObject.UserDataPointInputs.ForEach(inputPoint =>
-            {
-                inputPoint.TimeSteps = new List<UserDataPointTimeStep>();
-
-                foreach (var dateTime in parsedHeadAllOutputFile.Keys)
+                var nodePoints = nodeLocations.ToDictionary(x => x.Key, x => new Point(x.Value.Item2, x.Value.Item1));
+                // find the closest node to each of the input locations
+                userDataObject.UserDataPointInputs.ForEach(inputPoint =>
                 {
-                    var runValue = parsedHeadAllOutputFile[dateTime][inputPoint.ClosestNode][nodeToLayerMapping[inputPoint.ClosestNode]];
-                    double? baselineValue = null;
-                    double? baselineValueDifference = null;
-                    if (run.IsDifferential)
+                    var inputPointGeometry = new Point(inputPoint.Lng, inputPoint.Lat);
+                    var closestNode = nodePoints.Keys.Select(x => new
+                    { Node = x, Distance = nodePoints[x].Distance(inputPointGeometry) })
+                        .OrderBy(x => x.Distance)
+                        .First().Node;
+
+                    inputPoint.ClosestNode = closestNode;
+                });
+
+                var parsedHeadAllOutputFile = ParseHeadAllOutputFile(modelFileAccessor);
+                var baselineHeadAllOutputFile = ParseHeadAllOutputFile(modelFileAccessor, true);
+
+                // get the NodeWaterLevelLayer.csv file
+                // this file maps which layer each node will use, instead of it always defaulting to the last layer
+                var nodeToLayerMapping = modelFileAccessor.GetNodeWaterLevelLayerMapping();
+                userDataObject.UserDataPointInputs.ForEach(inputPoint =>
+                {
+                    inputPoint.TimeSteps = new List<UserDataPointTimeStep>();
+
+                    if (!nodeToLayerMapping.ContainsKey(inputPoint.ClosestNode))
                     {
-                        // get the difference between baseline and the run value for differential results
-                        baselineValue = baselineHeadAllOutputFile[dateTime][inputPoint.ClosestNode][nodeToLayerMapping[inputPoint.ClosestNode]];
-                        baselineValueDifference = baselineValue - runValue;
-                    }
-                    else
-                    {
-                        runValue = parsedHeadAllOutputFile[dateTime][inputPoint.ClosestNode][nodeToLayerMapping[inputPoint.ClosestNode]];
+                        Logger.LogWarning($"No water level layer mapping found for node {inputPoint.ClosestNode} (point '{inputPoint.Name}'); skipping.");
+                        return;
                     }
 
-                    inputPoint.TimeSteps.Add(new UserDataPointTimeStep()
+                    var layer = nodeToLayerMapping[inputPoint.ClosestNode];
+
+                    foreach (var dateTime in parsedHeadAllOutputFile.Keys)
                     {
-                        DateTime = dateTime,
-                        Value = runValue,
-                        BaselineValue = baselineValue,
-                        BaselineValueDifference = baselineValueDifference
-                    });
-                }
-            });
+                        if (!parsedHeadAllOutputFile[dateTime].ContainsKey(inputPoint.ClosestNode))
+                        {
+                            continue;
+                        }
+
+                        var runValue = parsedHeadAllOutputFile[dateTime][inputPoint.ClosestNode][layer];
+                        double? baselineValue = null;
+                        double? baselineValueDifference = null;
+                        if (run.IsDifferential)
+                        {
+                            // get the difference between baseline and the run value for differential results
+                            if (baselineHeadAllOutputFile.ContainsKey(dateTime) &&
+                                baselineHeadAllOutputFile[dateTime].ContainsKey(inputPoint.ClosestNode))
+                            {
+                                baselineValue = baselineHeadAllOutputFile[dateTime][inputPoint.ClosestNode][layer];
+                                baselineValueDifference = baselineValue - runValue;
+                            }
+                            else
+                            {
+                                Logger.LogWarning($"No baseline head data found for node {inputPoint.ClosestNode} at {dateTime}; skipping baseline comparison for point '{inputPoint.Name}'.");
+                            }
+                        }
+
+                        inputPoint.TimeSteps.Add(new UserDataPointTimeStep()
+                        {
+                            DateTime = dateTime,
+                            Value = runValue,
+                            BaselineValue = baselineValue,
+                            BaselineValueDifference = baselineValueDifference
+                        });
+                    }
+                });
+            }
+            else
+            {
+                Logger.LogInformation($"No UserDataPointInputs found in userdata.json for run {run.RunID}; writing empty groundwater level point output.");
+            }
 
             fileAccessor
                 .SaveFile(
